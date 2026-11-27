@@ -49,6 +49,7 @@ import (
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
+	"sigs.k8s.io/kueue/pkg/controller/core/workload"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	afs "sigs.k8s.io/kueue/pkg/util/admissionfairsharing"
@@ -431,7 +432,7 @@ func (r *LocalQueueReconciler) reconcileConsumedUsage(ctx context.Context, lq *k
 	}
 
 	oldUsage := entry.Resources
-	newUsage := afsAccountedUsage(r.cache, lq.Spec.ClusterQueue, cacheLq)
+	newUsage := workload.AfsAccountedUsage(r.cache, lq.Spec.ClusterQueue, cacheLq)
 	// A concurrent settlement can stamp an entry's LastUpdate later than now.
 	// A negative elapsed would drive the decay alpha outside [0, 1] and inflate
 	// consumed usage, so every elapsed derived from a stored LastUpdate is

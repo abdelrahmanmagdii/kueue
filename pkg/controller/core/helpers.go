@@ -18,12 +18,17 @@ package core
 
 import (
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/utils/clock"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/features"
 	utilmath "sigs.k8s.io/kueue/pkg/util/math"
 	"sigs.k8s.io/kueue/pkg/util/resourcegroups"
 )
+
+// realClock is the wall clock for core controllers that do not take an injected clock.
+// The workload controller keeps its own copy so this package and that one do not import each other.
+var realClock = clock.RealClock{}
 
 // clusterQueueSpecOrQuotaUpdated reports whether a ClusterQueue update changed
 // its spec or its effective resource groups, as opposed to only its status.

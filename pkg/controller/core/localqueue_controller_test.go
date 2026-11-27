@@ -42,6 +42,7 @@ import (
 	queueafs "sigs.k8s.io/kueue/pkg/cache/queue/afs"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
 	"sigs.k8s.io/kueue/pkg/controller/core/indexer"
+	"sigs.k8s.io/kueue/pkg/controller/core/workload"
 	"sigs.k8s.io/kueue/pkg/features"
 	kueuemetrics "sigs.k8s.io/kueue/pkg/metrics"
 	preemptexpectations "sigs.k8s.io/kueue/pkg/scheduler/preemption/expectations"
@@ -1727,7 +1728,7 @@ func TestLocalQueueDeleteWithConcurrentFinish(t *testing.T) {
 				WithCustomLabels(cLabels),
 				WithLocalQueueMetrics(lqMetrics),
 			)
-			wlReconciler := NewWorkloadReconciler(cl, qManager, cqCache, nil, WithWorkloadCustomLabels(cLabels))
+			wlReconciler := workload.NewWorkloadReconciler(cl, qManager, cqCache, nil, workload.WithWorkloadCustomLabels(cLabels))
 
 			r.Create(event.TypedCreateEvent[*kueue.LocalQueue]{Object: lq})
 
@@ -1747,7 +1748,7 @@ func TestLocalQueueDeleteWithConcurrentFinish(t *testing.T) {
 			lbls := map[string]string{"name": lq.Name, "namespace": lq.Namespace}
 			var recorded []utiltestingmetrics.MetricDataPoint
 			if err == nil {
-				wlReconciler.reportFinishedWorkload(log, wl)
+				wlReconciler.ReportFinishedWorkload(log, wl)
 				recorded = utiltestingmetrics.CollectFilteredGaugeVec(kueuemetrics.LocalQueueFinishedWorkloadsTotal, lbls)
 			}
 			qManager.Unlock()

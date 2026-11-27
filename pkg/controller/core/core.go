@@ -18,7 +18,6 @@ package core
 
 import (
 	"errors"
-	"time"
 
 	resourcev1 "k8s.io/api/resource/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,6 +30,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/controller/core/dqo"
 	"sigs.k8s.io/kueue/pkg/controller/core/localcapacity"
+	"sigs.k8s.io/kueue/pkg/controller/core/workload"
 	"sigs.k8s.io/kueue/pkg/dra"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
@@ -39,7 +39,6 @@ import (
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/limits"
 	"sigs.k8s.io/kueue/pkg/util/expectations"
 	"sigs.k8s.io/kueue/pkg/util/roletracker"
-	"sigs.k8s.io/kueue/pkg/util/waitforpodsready"
 )
 
 const (
@@ -121,19 +120,19 @@ func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.
 		return "ClusterQueue", err
 	}
 
-	workloadRec := NewWorkloadReconciler(mgr.GetClient(), qManager, cc,
+	workloadRec := workload.NewWorkloadReconciler(mgr.GetClient(), qManager, cc,
 		mgr.GetEventRecorder(constants.WorkloadControllerName),
-		WithWorkloadUpdateWatchers(qRec, cqRec),
-		WithWaitForPodsReady(waitForPodsReady(cfg.WaitForPodsReady)),
-		WithWorkloadRetention(workloadRetention(cfg.ObjectRetentionPolicies)),
-		WithWorkloadRoleTracker(opts.RoleTracker),
-		WithPreemptionExpectations(opts.PreemptionExpectations),
-		WithWorkloadCustomLabels(opts.CustomLabels),
-		WithAdmissionFairSharing(cfg.AdmissionFairSharing),
-		WithDRAMapper(opts.DRAMapper),
-		WithDRABackedResources(opts.DRABackedResources),
-		WithResourceFormatter(opts.ResourceFormatter),
-		WithResourceSliceAPIAvailable(opts.ResourceSliceAPIAvailable),
+		workload.WithWorkloadUpdateWatchers(qRec, cqRec),
+		workload.WithWaitForPodsReady(workload.WaitForPodsReady(cfg.WaitForPodsReady)),
+		workload.WithWorkloadRetention(workload.WorkloadRetention(cfg.ObjectRetentionPolicies)),
+		workload.WithWorkloadRoleTracker(opts.RoleTracker),
+		workload.WithPreemptionExpectations(opts.PreemptionExpectations),
+		workload.WithWorkloadCustomLabels(opts.CustomLabels),
+		workload.WithAdmissionFairSharing(cfg.AdmissionFairSharing),
+		workload.WithDRAMapper(opts.DRAMapper),
+		workload.WithDRABackedResources(opts.DRABackedResources),
+		workload.WithResourceFormatter(opts.ResourceFormatter),
+		workload.WithResourceSliceAPIAvailable(opts.ResourceSliceAPIAvailable),
 	)
 	if features.Enabled(features.KueueDRAIntegration) {
 		qManager.SetDRAReconcileChannel(workloadRec.GetDRAReconcileChannel())
@@ -192,36 +191,6 @@ func SetupControllers(mgr ctrl.Manager, qManager *qcache.Manager, cc *schdcache.
 	qManager.AddWorkloadUpdateWatcher(cqRec)
 
 	return "", nil
-}
-
-func waitForPodsReady(cfg *configapi.WaitForPodsReady) *waitForPodsReadyConfig {
-	if !waitforpodsready.Enabled(cfg) {
-		return nil
-	}
-	result := waitForPodsReadyConfig{
-		timeout: cfg.Timeout.Duration,
-	}
-	result.recoveryTimeout = waitforpodsready.RecoveryTimeout(cfg)
-	if waitforpodsready.PodsScheduledTrackingEnabled(cfg) {
-		result.unscheduledTimeout = &cfg.UnscheduledTimeout.Duration
-	}
-	if cfg.RequeuingStrategy != nil {
-		result.requeuingBackoffBaseSeconds = *cfg.RequeuingStrategy.BackoffBaseSeconds
-		result.requeuingBackoffLimitCount = cfg.RequeuingStrategy.BackoffLimitCount
-		result.requeuingBackoffMaxDuration = time.Duration(*cfg.RequeuingStrategy.BackoffMaxSeconds) * time.Second
-		result.requeuingBackoffJitter = 0.0001
-	}
-	return &result
-}
-
-func workloadRetention(cfg *configapi.ObjectRetentionPolicies) *workloadRetentionConfig {
-	if cfg == nil || cfg.Workloads == nil || cfg.Workloads.AfterFinished == nil {
-		return nil
-	}
-
-	return &workloadRetentionConfig{
-		afterFinished: &cfg.Workloads.AfterFinished.Duration,
-	}
 }
 
 // ServerSupportsResourceSlice checks if the server supports the ResourceSlice API (resource.k8s.io/v1).

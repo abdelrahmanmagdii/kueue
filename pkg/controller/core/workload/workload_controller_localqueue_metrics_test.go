@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package core
+package workload_test
 
 import (
 	"fmt"
@@ -30,6 +30,8 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/controller/core"
+	"sigs.k8s.io/kueue/pkg/controller/core/workload"
 	"sigs.k8s.io/kueue/pkg/metrics"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingmetrics "sigs.k8s.io/kueue/pkg/util/testing/metrics"
@@ -100,7 +102,7 @@ func TestWorkloadMetricsAfterLocalQueueDeletion(t *testing.T) {
 				if err := cl.Create(ctx, lq); err != nil {
 					t.Fatalf("Creating LocalQueue: %v", err)
 				}
-				lqReconciler := NewLocalQueueReconciler(cl, qManager, cqCache)
+				lqReconciler := core.NewLocalQueueReconciler(cl, qManager, cqCache)
 				lqReconciler.Create(event.TypedCreateEvent[*kueue.LocalQueue]{Object: lq})
 				wantLocalQueueSeries := 1
 				if deleteLocalQueue {
@@ -111,9 +113,9 @@ func TestWorkloadMetricsAfterLocalQueueDeletion(t *testing.T) {
 					wantLocalQueueSeries = 0
 				}
 
-				reconciler := NewWorkloadReconciler(cl, qManager, cqCache, &utiltesting.EventRecorder{})
+				reconciler := workload.NewWorkloadReconciler(cl, qManager, cqCache, &utiltesting.EventRecorder{})
 				if tc.oldWorkload != nil {
-					reconciler.handleUpdate(ctx, event.TypedUpdateEvent[*kueue.Workload]{
+					reconciler.UpdateForTest(ctx, event.TypedUpdateEvent[*kueue.Workload]{
 						ObjectOld: tc.oldWorkload.DeepCopy(),
 						ObjectNew: wl,
 					})
