@@ -17,7 +17,11 @@ limitations under the License.
 package limits
 
 import (
+	"fmt"
+
 	"github.com/go-logr/logr"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	kueuealpha "sigs.k8s.io/kueue/apis/kueue/v1alpha1"
@@ -28,13 +32,93 @@ import (
 	workloadevict "sigs.k8s.io/kueue/pkg/workload/evict"
 )
 
+// selectorError reports an invalid selector on a PreemptionLimit.
+type selectorError struct {
+	PreemptionLimit string
+	Selector        string
+	Err             error
+}
+
+func (e *selectorError) Error() string {
+	return fmt.Sprintf("preemptionLimit %q %s: %v", e.PreemptionLimit, e.Selector, e.Err)
+}
+
+func (e *selectorError) Unwrap() error {
+	return e.Err
+}
+
+// applicableLimit is a PreemptionLimit that applies to one PreemptionConfig,
+// with its ClusterQueue selectors compiled once for the scheduling attempt.
+type applicableLimit struct {
+	limit                         *kueuealpha.PreemptionLimit
+	preemptorClusterQueueSelector labels.Selector
+	preempteeClusterQueueSelector labels.Selector
+}
+
+// newApplicableLimit returns limit when it applies to config, or nil when its
+// configSelector does not. It returns an error if a selector it needs is invalid.
+// ClusterQueue selectors are parsed only after the config matches, so an invalid
+// ClusterQueue selector on a limit that does not apply to config is ignored.
+func newApplicableLimit(limit *kueuealpha.PreemptionLimit, config *kueuealpha.PreemptionConfig) (*applicableLimit, error) {
+	configSelector, err := metav1.LabelSelectorAsSelector(&limit.Spec.ConfigSelector)
+	if err != nil {
+		return nil, &selectorError{PreemptionLimit: limit.Name, Selector: "configSelector", Err: err}
+	}
+	if !configSelector.Matches(labels.Set(config.Labels)) {
+		return nil, nil
+	}
+	preemptorClusterQueueSelector, err := selectorOrEverything(limit.Spec.PreemptorClusterQueueSelector)
+	if err != nil {
+		return nil, &selectorError{PreemptionLimit: limit.Name, Selector: "preemptorClusterQueueSelector", Err: err}
+	}
+	preempteeClusterQueueSelector, err := selectorOrEverything(limit.Spec.PreempteeClusterQueueSelector)
+	if err != nil {
+		return nil, &selectorError{PreemptionLimit: limit.Name, Selector: "preempteeClusterQueueSelector", Err: err}
+	}
+	return &applicableLimit{
+		limit:                         limit,
+		preemptorClusterQueueSelector: preemptorClusterQueueSelector,
+		preempteeClusterQueueSelector: preempteeClusterQueueSelector,
+	}, nil
+}
+
+// selectorOrEverything is metav1.LabelSelectorAsSelector, except that nil selects everything.
+func selectorOrEverything(ls *metav1.LabelSelector) (labels.Selector, error) {
+	if ls == nil {
+		return labels.Everything(), nil
+	}
+	return metav1.LabelSelectorAsSelector(ls)
+}
+
+// matchesClusterQueues reports whether preemptorCQ and targetCQ match the
+// compiled ClusterQueue selectors of a limit.
+func matchesClusterQueues(preemptorSelector, preempteeSelector labels.Selector, preemptorCQ, targetCQ *schdcache.ClusterQueueSnapshot) bool {
+	return preemptorSelector.Matches(labels.Set(preemptorCQ.Labels)) &&
+		preempteeSelector.Matches(labels.Set(targetCQ.Labels))
+}
+
+// aggregationKey returns the key that identifies this preemption within aggregation.
+func aggregationKey(aggregation kueuealpha.PreemptionLimitAggregation, preemptor, target *workload.Info) policy.PreemptionLimitAggregationKey {
+	switch aggregation {
+	case kueuealpha.ByPreemptorCQLimitAggregation:
+		return policy.PreemptionLimitAggregationKey(preemptor.ClusterQueue)
+	case kueuealpha.ByPreempteeCQLimitAggregation:
+		return policy.PreemptionLimitAggregationKey(target.ClusterQueue)
+	case kueuealpha.ByPreempteeWorkloadLimitAggregation:
+		return policy.PreemptionLimitAggregationKey(workload.Key(target.Obj))
+	default:
+		// GlobalLimitAggregation, as the API admits no other aggregation.
+		return policy.GlobalAggregationKey
+	}
+}
+
 // PreemptionLimiter enforces the PreemptionLimits of a snapshot that apply to
 // a PreemptionConfig, during a single scheduling attempt.
 //
 // A nil PreemptionLimiter imposes no limits.
 type PreemptionLimiter struct {
 	log          logr.Logger
-	matchers     map[policy.PreemptionLimitReference]*preemptionLimitMatcher
+	applicable   map[policy.PreemptionLimitReference]*applicableLimit
 	expectations *expectations.Store
 	snapshot     *PreemptionLimitsSnapshot
 }
@@ -47,22 +131,22 @@ func NewPreemptionLimiter(
 	config *kueuealpha.PreemptionConfig,
 	preemptionExpectations *expectations.Store,
 ) (*PreemptionLimiter, error) {
-	matchers := make(map[policy.PreemptionLimitReference]*preemptionLimitMatcher)
+	applicable := make(map[policy.PreemptionLimitReference]*applicableLimit)
 	for ref, state := range snapshot.limits {
 		if state.limit == nil {
 			continue
 		}
-		matcher, err := newPreemptionLimitMatcher(state.limit, config)
+		limit, err := newApplicableLimit(state.limit, config)
 		if err != nil {
 			return nil, err
 		}
-		if matcher != nil {
-			matchers[ref] = matcher
+		if limit != nil {
+			applicable[ref] = limit
 		}
 	}
 	return &PreemptionLimiter{
 		log:          log,
-		matchers:     matchers,
+		applicable:   applicable,
 		expectations: preemptionExpectations,
 		snapshot:     snapshot,
 	}, nil
@@ -78,9 +162,9 @@ func (l *PreemptionLimiter) consumedLimits(
 		return nil
 	}
 	consumedLimits := make(policy.ConsumedLimits)
-	for ref, matcher := range l.matchers {
-		if matcher.matchesClusterQueues(preemptorCQ, targetCQ) {
-			consumedLimits[ref] = policy.NewConsumedLimit(matcher.limit, matcher.aggregationKey(preemptor, target))
+	for ref, limit := range l.applicable {
+		if matchesClusterQueues(limit.preemptorClusterQueueSelector, limit.preempteeClusterQueueSelector, preemptorCQ, targetCQ) {
+			consumedLimits[ref] = policy.NewConsumedLimit(limit.limit, aggregationKey(limit.limit.Spec.Aggregation, preemptor, target))
 		}
 	}
 	return consumedLimits

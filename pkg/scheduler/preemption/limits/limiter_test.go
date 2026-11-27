@@ -18,6 +18,8 @@ package limits
 
 import (
 	"cmp"
+	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"testing"
@@ -89,7 +91,7 @@ func TestNewPreemptionLimiter(t *testing.T) {
 			if err != nil {
 				return
 			}
-			got := slices.Sorted(maps.Keys(limiter.matchers))
+			got := slices.Sorted(maps.Keys(limiter.applicable))
 			if diff := gocmp.Diff(tc.want, got); diff != "" {
 				t.Errorf("Unexpected limits (-want,+got):\n%s", diff)
 			}
@@ -164,4 +166,145 @@ func TestPreemptionLimiterConsumedLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNewApplicableLimit(t *testing.T) {
+	config := utiltestingalpha.MakePreemptionConfig("config").Label("tier", "gold").Obj()
+	selectsGold := metav1.LabelSelector{MatchLabels: map[string]string{"tier": "gold"}}
+	selectsSilver := metav1.LabelSelector{MatchLabels: map[string]string{"tier": "silver"}}
+	invalidSelector := &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: "tier", Operator: "invalid"}},
+	}
+	limit := utiltestingalpha.MakePreemptionLimit("limit", kueuealpha.GlobalLimitAggregation).WindowSeconds(60)
+
+	cases := map[string]struct {
+		limit       *kueuealpha.PreemptionLimit
+		wantApplies bool
+		wantErr     *selectorError
+	}{
+		"limit with empty configSelector applies": {
+			limit:       limit.Clone().Obj(),
+			wantApplies: true,
+		},
+		"limit whose configSelector selects the config applies": {
+			limit:       limit.Clone().ConfigSelector(selectsGold).Obj(),
+			wantApplies: true,
+		},
+		"limit whose configSelector doesn't select the config doesn't apply": {
+			limit: limit.Clone().ConfigSelector(selectsSilver).Obj(),
+		},
+		"invalid configSelector is an error": {
+			limit:   limit.Clone().ConfigSelector(*invalidSelector).Obj(),
+			wantErr: &selectorError{PreemptionLimit: "limit", Selector: "configSelector"},
+		},
+		"invalid preemptorClusterQueueSelector of a limit applying to the config is an error": {
+			limit:   limit.Clone().PreemptorClusterQueueSelector(invalidSelector).Obj(),
+			wantErr: &selectorError{PreemptionLimit: "limit", Selector: "preemptorClusterQueueSelector"},
+		},
+		"invalid preempteeClusterQueueSelector of a limit applying to the config is an error": {
+			limit:   limit.Clone().PreempteeClusterQueueSelector(invalidSelector).Obj(),
+			wantErr: &selectorError{PreemptionLimit: "limit", Selector: "preempteeClusterQueueSelector"},
+		},
+		"invalid ClusterQueue selectors of a limit not applying to the config are ignored": {
+			limit: limit.Clone().
+				ConfigSelector(selectsSilver).
+				PreemptorClusterQueueSelector(invalidSelector).
+				PreempteeClusterQueueSelector(invalidSelector).
+				Obj(),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := newApplicableLimit(tc.limit, config)
+			if diff := diffSelectorError(tc.wantErr, err); diff != "" {
+				t.Fatalf("newApplicableLimit() unexpected error (-want,+got):\n%s", diff)
+			}
+			if err != nil {
+				return
+			}
+			if applies := got != nil; applies != tc.wantApplies {
+				t.Fatalf("newApplicableLimit() = %v, want a limit: %v", got, tc.wantApplies)
+			}
+			if got != nil && got.limit != tc.limit {
+				t.Errorf("newApplicableLimit() limit = %v, want %v", got.limit, tc.limit)
+			}
+		})
+	}
+}
+
+func TestMatchesClusterQueues(t *testing.T) {
+	preemptorCQ := &schdcache.ClusterQueueSnapshot{Name: "preemptor-cq", Labels: map[string]string{"side": "preemptor"}}
+	targetCQ := &schdcache.ClusterQueueSnapshot{Name: "preemptee-cq", Labels: map[string]string{"side": "preemptee"}}
+	selectsPreemptor := &metav1.LabelSelector{MatchLabels: map[string]string{"side": "preemptor"}}
+	selectsPreemptee := &metav1.LabelSelector{MatchLabels: map[string]string{"side": "preemptee"}}
+
+	cases := map[string]struct {
+		preemptorClusterQueueSelector *metav1.LabelSelector
+		preempteeClusterQueueSelector *metav1.LabelSelector
+		want                          bool
+	}{
+		"limit without ClusterQueue selectors matches any ClusterQueues": {
+			want: true,
+		},
+		"limit matches when both ClusterQueue selectors match": {
+			preemptorClusterQueueSelector: selectsPreemptor,
+			preempteeClusterQueueSelector: selectsPreemptee,
+			want:                          true,
+		},
+		"limit doesn't match when preemptorClusterQueueSelector doesn't match": {
+			preemptorClusterQueueSelector: selectsPreemptee,
+			preempteeClusterQueueSelector: selectsPreemptee,
+			want:                          false,
+		},
+		"limit doesn't match when preempteeClusterQueueSelector doesn't match": {
+			preemptorClusterQueueSelector: selectsPreemptor,
+			preempteeClusterQueueSelector: selectsPreemptor,
+			want:                          false,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			limit := utiltestingalpha.MakePreemptionLimit("limit", kueuealpha.GlobalLimitAggregation).
+				WindowSeconds(60).
+				PreemptorClusterQueueSelector(tc.preemptorClusterQueueSelector).
+				PreempteeClusterQueueSelector(tc.preempteeClusterQueueSelector).
+				Obj()
+			applicable, err := newApplicableLimit(limit, utiltestingalpha.MakePreemptionConfig("config").Obj())
+			if err != nil {
+				t.Fatalf("newApplicableLimit() unexpected error: %v", err)
+			}
+			got := matchesClusterQueues(applicable.preemptorClusterQueueSelector, applicable.preempteeClusterQueueSelector, preemptorCQ, targetCQ)
+			if got != tc.want {
+				t.Errorf("matchesClusterQueues() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAggregationKey(t *testing.T) {
+	preemptor := &workload.Info{Obj: utiltestingapi.MakeWorkload("preemptor", "ns").Obj(), ClusterQueue: "preemptor-cq"}
+	target := &workload.Info{Obj: utiltestingapi.MakeWorkload("target", "ns").Obj(), ClusterQueue: "preemptee-cq"}
+
+	cases := map[kueuealpha.PreemptionLimitAggregation]policy.PreemptionLimitAggregationKey{
+		kueuealpha.GlobalLimitAggregation:              policy.GlobalAggregationKey,
+		kueuealpha.ByPreemptorCQLimitAggregation:       "preemptor-cq",
+		kueuealpha.ByPreempteeCQLimitAggregation:       "preemptee-cq",
+		kueuealpha.ByPreempteeWorkloadLimitAggregation: "ns/target",
+	}
+	for aggregation, want := range cases {
+		t.Run(string(aggregation), func(t *testing.T) {
+			if got := aggregationKey(aggregation, preemptor, target); got != want {
+				t.Errorf("aggregationKey() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// diffSelectorError compares err with want, ignoring the wrapped error.
+func diffSelectorError(want *selectorError, err error) string {
+	var got *selectorError
+	if err != nil && !errors.As(err, &got) {
+		return fmt.Sprintf("unexpected error type: %v", err)
+	}
+	return gocmp.Diff(want, got, cmpopts.IgnoreFields(selectorError{}, "Err"))
 }
