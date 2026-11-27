@@ -49,7 +49,6 @@ import (
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	schedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
-	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -2294,49 +2293,62 @@ func TestRemoveCompositePodGroup(t *testing.T) {
 	}
 }
 
-func Test_newWASSchedulerConfig_GangSchedulingPluginEnabled(t *testing.T) {
+// TestScheduleWorkloadRejectsPodGroupBelowMinCount checks GangScheduling through
+// the public simulator. A PodGroup with fewer Pods than MinCount is rejected even
+// though the Pod fits on the node. A disabled GangScheduling plugin ignores
+// MinCount and places that Pod, so this rejection fails if the plugin is dropped
+// from the profile.
+func TestScheduleWorkloadRejectsPodGroupBelowMinCount(t *testing.T) {
 	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, kubefeatures.GenericWorkload, true)
-	ctx := klog.NewContext(t.Context(), logr.Discard())
+	features.SetFeatureGateDuringTest(t, features.SchedulerLibraryDeepIntegration, true)
+	ctx := t.Context()
 
-	kubeClient := fake.NewSimpleClientset()
-	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
-	_ = informerFactory.Core().V1().Nodes().Informer()
-	_ = informerFactory.Core().V1().Pods().Informer()
-	cfg := newWASSchedulerConfig()
-	comps, err := upstreamsync.NewFrameworkComponents(ctx, kubeClient, informerFactory,
-		upstreamsync.WithProfiles(cfg.Profiles...))
-	if err != nil {
-		t.Fatalf("NewFrameworkComponents failed: %v", err)
-	}
-	profiles, err := upstreamsync.NewFrameworkMap(ctx, comps, framework.DiscardRecorderFactory, cache.NewEmptySnapshot())
-	if err != nil {
-		t.Fatalf("NewFrameworkMap failed: %v", err)
-	}
+	node := testingnode.MakeNode("node1").
+		Label(corev1.LabelHostname, "node1").
+		StatusAllocatable(corev1.ResourceList{
+			corev1.ResourceCPU:  resource.MustParse("4"),
+			corev1.ResourcePods: resource.MustParse("10"),
+		}).
+		Ready().
+		Obj()
 
-	pod := testingpod.MakePod("p1", "default").UID("p1-uid").Obj()
-	pod.Spec.SchedulerName = placementProfileScheduler
-	schedFwk, err := profiles.FrameworkForPod(pod)
+	factory, err := NewWASSimulatorFactory(klog.NewContext(ctx, logr.Discard()), nil)
 	if err != nil {
-		t.Fatalf("FrameworkForPod failed: %v", err)
+		t.Fatalf("NewWASSimulatorFactory failed: %v", err)
+	}
+	sim, err := factory.NewSimulator(ctx, []*corev1.Node{node}, &podtracker.Tracker{})
+	if err != nil {
+		t.Fatalf("NewSimulator failed: %v", err)
 	}
 
-	pgInfo := &k8sframework.PodGroupInfo{
-		PodGroup: &schedulingv1beta1.PodGroup{
-			Spec: schedulingv1beta1.PodGroupSpec{
-				SchedulingPolicy: schedulingv1beta1.PodGroupSchedulingPolicy{
-					Gang: &schedulingv1beta1.GangSchedulingPolicy{MinCount: 2},
-				},
+	pg := &schedulingv1beta1.PodGroup{
+		Name:      "pg",
+		Namespace: "default",
+		Spec: schedulingv1beta1.PodGroupSpec{
+			SchedulingPolicy: schedulingv1beta1.PodGroupSchedulingPolicy{
+				Gang: &schedulingv1beta1.GangSchedulingPolicy{MinCount: 2},
 			},
 		},
 	}
+	if err := sim.AddPodGroup(ctx, pg); err != nil {
+		t.Fatalf("AddPodGroup failed: %v", err)
+	}
 
-	// Fewer pods than MinCount (1 < 2) must be rejected
-	status := schedFwk.RunPlacementFeasiblePlugins(ctx, k8sframework.NewCycleState(), pgInfo, k8sframework.PlacementProgress{
-		Remaining: 1,
-		Scheduled: 0,
-	})
-	if status.Code() != fwk.Unschedulable {
-		t.Errorf("RunPlacementFeasiblePlugins status = %v, want %v", status.Code(), fwk.Unschedulable)
+	pod := testingpod.MakePod("p1", "default").
+		UID("p1-uid").
+		SchedulingGroup("pg").
+		Obj()
+
+	got := sim.ScheduleWorkload(ctx, []*corev1.Pod{pod})
+	want := simulator.SchedulingResult{
+		PodPlacements: simulator.PodPlacements{
+			client.ObjectKeyFromObject(pod): {
+				Reasons: []string{"minCount (2) cannot be satisfied: 0 scheduled, 1 remaining"},
+			},
+		},
+	}
+	if diff := cmp.Diff(want, got, cmpErrorMessage); diff != "" {
+		t.Errorf("ScheduleWorkload() unexpected result (-want,+got):\n%s", diff)
 	}
 }
 
